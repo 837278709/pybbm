@@ -2,7 +2,10 @@
 from __future__ import unicode_literals
 
 from django.core.exceptions import ValidationError
-from django.core.urlresolvers import reverse
+try:
+    from django.core.urlresolvers import reverse
+except ImportError:
+    from django.urls import reverse
 from django.db import models, transaction, DatabaseError
 from django.utils.encoding import python_2_unicode_compatible
 from django.utils.functional import cached_property
@@ -17,20 +20,12 @@ from pybb.util import unescape, FilePathGenerator, _get_markup_formatter
 
 from annoying.fields import AutoOneToOneField
 
-try:
-    from south.modelsinspector import add_introspection_rules
-
-    add_introspection_rules([], ["^annoying\.fields\.JSONField"])
-    add_introspection_rules([], ["^annoying\.fields\.AutoOneToOneField"])
-except ImportError:
-    pass
-
 
 @python_2_unicode_compatible
 class Category(models.Model):
     name = models.CharField(_('Name'), max_length=80)
     position = models.IntegerField(_('Position'), blank=True, default=0)
-    hidden = models.BooleanField(_('Hidden'), blank=False, null=False, default=False,
+    hidden = models.BooleanField(_('Hidden'), default=False,
                                  help_text=_('If checked, this category will be visible only for staff'))
     slug = models.SlugField(_("Slug"), max_length=255, unique=True)
 
@@ -61,8 +56,8 @@ class Category(models.Model):
 
 @python_2_unicode_compatible
 class Forum(models.Model):
-    category = models.ForeignKey(Category, related_name='forums', verbose_name=_('Category'))
-    parent = models.ForeignKey('self', related_name='child_forums', verbose_name=_('Parent forum'),
+    category = models.ForeignKey(Category, on_delete=models.CASCADE, related_name='forums', verbose_name=_('Category'))
+    parent = models.ForeignKey('self', on_delete=models.CASCADE, related_name='child_forums', verbose_name=_('Parent forum'),
                                blank=True, null=True)
     name = models.CharField(_('Name'), max_length=80)
     position = models.IntegerField(_('Position'), blank=True, default=0)
@@ -71,7 +66,7 @@ class Forum(models.Model):
     updated = models.DateTimeField(_('Updated'), blank=True, null=True)
     post_count = models.IntegerField(_('Post count'), blank=True, default=0)
     topic_count = models.IntegerField(_('Topic count'), blank=True, default=0)
-    hidden = models.BooleanField(_('Hidden'), blank=False, null=False, default=False)
+    hidden = models.BooleanField(_('Hidden'), default=False)
     readed_by = models.ManyToManyField(get_user_model_path(), through='ForumReadTracker', related_name='readed_forums')
     headline = models.TextField(_('Headline'), blank=True, null=True)
     slug = models.SlugField(verbose_name=_("Slug"), max_length=255)
@@ -129,6 +124,53 @@ class Forum(models.Model):
 
 
 @python_2_unicode_compatible
+class ForumSubscription(models.Model):
+
+    TYPE_NOTIFY = 1
+    TYPE_SUBSCRIBE = 2
+    TYPE_CHOICES = (
+        (TYPE_NOTIFY, _('be notified only when a new topic is added')),
+        (TYPE_SUBSCRIBE, _('be auto-subscribed to topics')),
+    )
+
+    user = models.ForeignKey(get_user_model_path(), on_delete=models.CASCADE,
+        related_name='forum_subscriptions+', verbose_name=_('Subscriber'))
+    forum = models.ForeignKey(Forum, on_delete=models.CASCADE,
+        related_name='subscriptions+', verbose_name=_('Forum'))
+    type = models.PositiveSmallIntegerField(
+        _('Subscription type'), choices=TYPE_CHOICES,
+        help_text=_((
+            'The auto-subscription works like you manually subscribed to watch each topic :\n'
+            'you will be notified when a topic will receive an answer. \n'
+            'If you choose to be notified only when a new topic is added. It means'
+            'you will be notified only once when the topic is created : '
+            'you won\'t be notified for the answers.'
+        )), )
+
+    class Meta(object):
+        verbose_name = _('Subscription to forum')
+        verbose_name_plural = _('Subscriptions to forums')
+        unique_together = ('user', 'forum',)
+
+    def __str__(self):
+        return '%(user)s\'s subscription to "%(forum)s"' % {'user': self.user,
+                                                            'forum': self.forum}
+
+    def save(self, all_topics=False, **kwargs):
+        if all_topics and self.type == self.TYPE_SUBSCRIBE:
+            old = None if not self.pk else ForumSubscription.objects.get(pk=self.pk)
+            if not old or old.type != self.type :
+                topics = Topic.objects.filter(forum=self.forum).exclude(subscribers=self.user)
+                self.user.subscriptions.add(*topics)
+        super(ForumSubscription, self).save(**kwargs)
+
+    def delete(self, all_topics=False, **kwargs):
+        if all_topics:
+            topics = Topic.objects.filter(forum=self.forum, subscribers=self.user)
+            self.user.subscriptions.remove(*topics)
+        super(ForumSubscription, self).delete(**kwargs)
+
+@python_2_unicode_compatible
 class Topic(models.Model):
     POLL_TYPE_NONE = 0
     POLL_TYPE_SINGLE = 1
@@ -140,14 +182,14 @@ class Topic(models.Model):
         (POLL_TYPE_MULTIPLE, _('Multiple answers')),
     )
 
-    forum = models.ForeignKey(Forum, related_name='topics', verbose_name=_('Forum'))
+    forum = models.ForeignKey(Forum, on_delete=models.CASCADE, related_name='topics', verbose_name=_('Forum'))
     name = models.CharField(_('Subject'), max_length=255)
-    created = models.DateTimeField(_('Created'), null=True)
-    updated = models.DateTimeField(_('Updated'), null=True)
-    user = models.ForeignKey(get_user_model_path(), verbose_name=_('User'))
+    created = models.DateTimeField(_('Created'), null=True, db_index=True)
+    updated = models.DateTimeField(_('Updated'), null=True, db_index=True)
+    user = models.ForeignKey(get_user_model_path(), on_delete=models.CASCADE, verbose_name=_('User'))
     views = models.IntegerField(_('Views count'), blank=True, default=0)
-    sticky = models.BooleanField(_('Sticky'), blank=True, default=False)
-    closed = models.BooleanField(_('Closed'), blank=True, default=False)
+    sticky = models.BooleanField(_('Sticky'), default=False)
+    closed = models.BooleanField(_('Closed'), default=False)
     subscribers = models.ManyToManyField(get_user_model_path(), related_name='subscriptions',
                                          verbose_name=_('Subscribers'), blank=True)
     post_count = models.IntegerField(_('Post count'), blank=True, default=0)
@@ -243,7 +285,7 @@ class RenderableItem(models.Model):
     body_text = models.TextField(_('Text version'))
 
     def render(self):
-        self.body_html = _get_markup_formatter()(self.body)
+        self.body_html = _get_markup_formatter()(self.body, instance=self)
         # Remove tags which was generated with the markup processor
         text = strip_tags(self.body_html)
         # Unescape entities which was generated with the markup processor
@@ -252,10 +294,10 @@ class RenderableItem(models.Model):
 
 @python_2_unicode_compatible
 class Post(RenderableItem):
-    topic = models.ForeignKey(Topic, related_name='posts', verbose_name=_('Topic'))
-    user = models.ForeignKey(get_user_model_path(), related_name='posts', verbose_name=_('User'))
+    topic = models.ForeignKey(Topic, on_delete=models.CASCADE, related_name='posts', verbose_name=_('Topic'))
+    user = models.ForeignKey(get_user_model_path(), on_delete=models.CASCADE, related_name='posts', verbose_name=_('User'))
     created = models.DateTimeField(_('Created'), blank=True, db_index=True)
-    updated = models.DateTimeField(_('Updated'), blank=True, null=True)
+    updated = models.DateTimeField(_('Updated'), blank=True, null=True, db_index=True)
     user_ip = models.GenericIPAddressField(_('User IP'), blank=True, null=True, default='0.0.0.0')
     on_moderation = models.BooleanField(_('On moderation'), default=False)
 
@@ -271,6 +313,10 @@ class Post(RenderableItem):
 
     def __str__(self):
         return self.summary()
+
+    @cached_property
+    def is_topic_head(self):
+        return self.pk and self.topic.head.pk == self.pk
 
     def save(self, *args, **kwargs):
         created_at = tznow()
@@ -326,7 +372,9 @@ class Profile(PybbProfile):
     Profile class that can be used if you doesn't have
     your site profile.
     """
-    user = AutoOneToOneField(get_user_model_path(), related_name='pybb_profile', verbose_name=_('User'))
+    user = AutoOneToOneField(
+        get_user_model_path(), on_delete=models.CASCADE,
+        related_name='pybb_profile', verbose_name=_('User'))
 
     class Meta(object):
         verbose_name = _('Profile')
@@ -344,7 +392,7 @@ class Attachment(models.Model):
         verbose_name = _('Attachment')
         verbose_name_plural = _('Attachments')
 
-    post = models.ForeignKey(Post, verbose_name=_('Post'), related_name='attachments')
+    post = models.ForeignKey(Post, on_delete=models.CASCADE, verbose_name=_('Post'), related_name='attachments')
     size = models.IntegerField(_('Size'))
     file = models.FileField(_('File'),
                             upload_to=FilePathGenerator(to=defaults.PYBB_ATTACHMENT_UPLOAD_TO))
@@ -389,8 +437,8 @@ class TopicReadTracker(models.Model):
     """
     Save per user topic read tracking
     """
-    user = models.ForeignKey(get_user_model_path(), blank=False, null=False)
-    topic = models.ForeignKey(Topic, blank=True, null=True)
+    user = models.ForeignKey(get_user_model_path(), on_delete=models.CASCADE, blank=False, null=False)
+    topic = models.ForeignKey(Topic, on_delete=models.CASCADE, blank=True, null=True)
     time_stamp = models.DateTimeField(auto_now=True)
 
     objects = TopicReadTrackerManager()
@@ -427,8 +475,8 @@ class ForumReadTracker(models.Model):
     """
     Save per user forum read tracking
     """
-    user = models.ForeignKey(get_user_model_path(), blank=False, null=False)
-    forum = models.ForeignKey(Forum, blank=True, null=True)
+    user = models.ForeignKey(get_user_model_path(), on_delete=models.CASCADE, blank=False, null=False)
+    forum = models.ForeignKey(Forum, on_delete=models.CASCADE, blank=True, null=True)
     time_stamp = models.DateTimeField(auto_now=True)
 
     objects = ForumReadTrackerManager()
@@ -441,7 +489,7 @@ class ForumReadTracker(models.Model):
 
 @python_2_unicode_compatible
 class PollAnswer(models.Model):
-    topic = models.ForeignKey(Topic, related_name='poll_answers', verbose_name=_('Topic'))
+    topic = models.ForeignKey(Topic, on_delete=models.CASCADE, related_name='poll_answers', verbose_name=_('Topic'))
     text = models.CharField(max_length=255, verbose_name=_('Text'))
 
     class Meta:
@@ -464,8 +512,8 @@ class PollAnswer(models.Model):
 
 @python_2_unicode_compatible
 class PollAnswerUser(models.Model):
-    poll_answer = models.ForeignKey(PollAnswer, related_name='users', verbose_name=_('Poll answer'))
-    user = models.ForeignKey(get_user_model_path(), related_name='poll_answers', verbose_name=_('User'))
+    poll_answer = models.ForeignKey(PollAnswer, on_delete=models.CASCADE, related_name='users', verbose_name=_('Poll answer'))
+    user = models.ForeignKey(get_user_model_path(), on_delete=models.CASCADE, related_name='poll_answers', verbose_name=_('User'))
     timestamp = models.DateTimeField(auto_now_add=True)
 
     class Meta:

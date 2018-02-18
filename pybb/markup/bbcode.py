@@ -25,12 +25,20 @@ class BBCodeWidget(Textarea):
 
     def render(self, *args, **kwargs):
         tpl = get_template('pybb/markup/bbcode_widget.html')
-        ctx = Context({'widget_output': super(BBCodeWidget, self).render(*args, **kwargs)})
+        ctx = {'widget_output': super(BBCodeWidget, self).render(*args, **kwargs)}
         return tpl.render(ctx)
 
 
 class BBCodeParser(BaseParser):
     widget_class = BBCodeWidget
+
+    def __init__(self):
+        self._parser = Parser()
+        self._parser.add_simple_formatter('img', '<img src="%(value)s">', replace_links=False)
+        self._parser.add_simple_formatter('code', '<pre><code>%(value)s</code></pre>',
+                                          render_embedded=False, transform_newlines=False,
+                                          swallow_trailing_newline=True, replace_cosmetic=False)
+        self._parser.add_formatter('quote', self._render_quote, strip=True, swallow_trailing_newline=True)
 
     def _render_quote(self, name, value, options, parent, context):
         if options and 'quote' in options:
@@ -39,15 +47,9 @@ class BBCodeParser(BaseParser):
             origin_author_html = ''
         return '<blockquote>%s%s</blockquote>' % (origin_author_html, value)
 
-    def __init__(self):
-        self._parser = Parser()
-        self._parser.add_simple_formatter('img', '<img src="%(value)s">', replace_links=False)
-        self._parser.add_simple_formatter('code', '<pre><code>%(value)s</code></pre>',
-                                          render_embedded=False, transform_newlines=False,
-                                          swallow_trailing_newline=True)
-        self._parser.add_formatter('quote', self._render_quote, strip=True, swallow_trailing_newline=True)
-
-    def format(self, text):
+    def format(self, text, instance=None):
+        if instance and instance.pk:
+            text = self.format_attachments(text, attachments=instance.attachments.all())
         return smile_it(self._parser.format(text))
 
     def quote(self, text, username=''):
